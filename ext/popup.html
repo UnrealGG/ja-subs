@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body{width:296px;margin:0;padding:12px;font:13px/1.5 "Microsoft YaHei UI",sans-serif;
+       background:#16181c;color:#e6e6e6}
+  h1{font-size:14px;margin:0 0 8px;color:#8ab4f8;font-weight:600}
+  button{width:100%;padding:8px;border:0;border-radius:6px;cursor:pointer;font-size:13px;
+         font-weight:600;margin-bottom:8px}
+  #toggle{background:#3b82f6;color:#fff}
+  #toggle.on{background:#b91c1c}
+  #reset{background:#2a2e35;color:#bbb;font-weight:400;padding:6px;margin:10px 0 0}
+  .row{display:flex;align-items:center;gap:6px;margin:6px 0}
+  .row span{color:#9aa0a6;white-space:nowrap;width:72px;flex:none}
+  select{flex:1;background:#22252b;color:#e6e6e6;border:1px solid #333;border-radius:4px;padding:4px}
+  input[type=range]{flex:1;accent-color:#3b82f6}
+  input[type=checkbox]{accent-color:#3b82f6}
+  #alphaVal{color:#9aa0a6;width:34px;text-align:right;font-size:12px}
+  details{margin-top:2px;border-top:1px solid #262a30;padding-top:6px}
+  summary{cursor:pointer;color:#8ab4f8;outline:none;margin-bottom:4px}
+  #status{color:#9aa0a6;font-size:12px;margin-top:6px;min-height:30px;word-break:break-all;
+          white-space:pre-wrap}
+  .hint{color:#666;font-size:11px;margin-top:6px;border-top:1px solid #262a30;padding-top:6px}
+</style>
+</head>
+<body>
+  <h1>日语实时间幕</h1>
+  <button id="toggle">开启字幕</button>
+
+  <div class="row"><span>显示</span>
+    <select id="mode">
+      <option value="both">原文 + 译文</option>
+      <option value="zh">只看译文</option>
+      <option value="ja">只看原文</option>
+    </select>
+  </div>
+
+  <details id="more" open>
+    <summary>更多设置</summary>
+
+    <div class="row"><span>字幕大小</span>
+      <select id="size">
+        <option value="16">小</option><option value="22">中</option>
+        <option value="28">大</option><option value="34">特大</option>
+      </select>
+    </div>
+    <div class="row"><span>字幕颜色</span>
+      <select id="color">
+        <option value="#ffffff">白色</option>
+        <option value="#ffe14d">黄色</option>
+        <option value="#7ee0ff">青色</option>
+        <option value="#8ef58e">绿色</option>
+        <option value="#ffa8d6">粉色</option>
+      </select>
+    </div>
+    <div class="row"><span>描边方式</span>
+      <select id="outline">
+        <option value="none">无描边</option>
+        <option value="thin">细描边</option>
+        <option value="bold">粗描边</option>
+      </select>
+    </div>
+    <div class="row"><span>默认位置</span>
+      <select id="pos">
+        <option value="low">贴近进度条</option>
+        <option value="mid">画面中下</option>
+        <option value="high">画面上方</option>
+      </select>
+    </div>
+    <div class="row"><span>背景透明</span>
+      <input type="range" id="alpha" min="0" max="100" step="5">
+      <span id="alphaVal"></span>
+    </div>
+    <div class="row"><span>其它</span>
+      <label style="margin-right:12px"><input type="checkbox" id="fade"> 淡入淡出</label>
+      <label><input type="checkbox" id="scale"> 等比缩放</label>
+    </div>
+    <div class="row"><span>翻译模型</span>
+      <select id="mt">
+        <option value="qwen3.5:latest">标准 · qwen3.5 9B（更准）</option>
+        <option value="qwen2.5:3b">轻量 · qwen2.5 3B（省显存）</option>
+      </select>
+    </div>
+    <button id="reset">恢复默认设置</button>
+  </details>
+
+  <button id="diag">诊断</button>
+  <div id="status">未开始</div>
+  <div class="hint">关字幕直接点上面的按钮，或在页面里改设置即时生效。</div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+# Local runtime and generated artifacts
+.venv/
+libs/
+model_ja/
+installer/wheels/
+logs/
+archive/
+JaSubs.exe
+JaSubs.settings
+native/ja_host.exe
+native/com.jasubs.launcher.json
+
+# Large or downloaded models
+models/*
+!models/vad/
+!models/vad/silero_vad.onnx
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Logs and editor/OS noise
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini

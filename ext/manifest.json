@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "日语实时间幕 JA Live Sub",
+  "version": "0.6.2",
+  "description": "抓取系统播放音频，用本地模型实时识别日语并显示中日/日文字幕",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "ws://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "日语实时间幕"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
