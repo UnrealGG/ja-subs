@@ -42,9 +42,9 @@
            pointer-events:none;
            font-family:"Microsoft YaHei UI","Yu Gothic UI","Hiragino Sans",sans-serif}
       .ja{color:#9fd0ff;line-height:1.35;margin-bottom:2px;word-break:break-word;
-          text-shadow:var(--ol)}
+          white-space:pre-line;text-shadow:var(--ol)}
       .zh{color:var(--zh);font-weight:700;line-height:1.35;word-break:break-word;
-          text-shadow:var(--ol)}
+          white-space:pre-line;text-shadow:var(--ol)}
       .tip{position:absolute;left:8%;bottom:var(--bottom);background:rgba(16,16,16,var(--bg));
            color:#bbb;padding:6px 12px;border-radius:6px;
            font:12px/1.4 "Microsoft YaHei UI",sans-serif}

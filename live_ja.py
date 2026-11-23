@@ -16,9 +16,11 @@
 操作：拖动字幕可移动位置；右键菜单或右上角 ✕ 退出。
 """
 import argparse
+import difflib
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -107,32 +109,92 @@ def _resolve_loopback(device_kw):
     raise SystemExit(f"默认输出设备「{name}」没有对应的回环设备，用 --list 和 --device 指定")
 
 
-def _to_mono_16k(data, in_rate):
-    """把立体声采集降到识别所需的 16kHz 单声道。"""
+def _resample_16k(data, in_rate):
+    """把采集数据降到 16kHz，保留原来的声道数。"""
     x = np.asarray(data, dtype=np.float32)
-    if x.ndim > 1:
-        x = x.mean(axis=1)
+    if x.ndim == 1:
+        x = x[:, None]
     if in_rate == SR:
         return x
     if in_rate % SR == 0:
         factor = in_rate // SR
         n = len(x) // factor * factor
         if n == 0:
-            return np.empty(0, dtype=np.float32)
-        return x[:n].reshape(-1, factor).mean(axis=1)
+            return np.empty((0, x.shape[1]), dtype=np.float32)
+        return x[:n].reshape(-1, factor, x.shape[1]).mean(axis=1)
     if len(x) < 2:
-        return np.empty(0, dtype=np.float32)
+        return np.empty((0, x.shape[1]), dtype=np.float32)
     n = max(1, int(round(len(x) * SR / in_rate)))
-    idx = np.arange(n, dtype=np.float64) * in_rate / SR
-    return np.interp(idx, np.arange(len(x)), x).astype(np.float32)
+    idx = np.minimum(np.arange(n, dtype=np.float64) * in_rate / SR, len(x) - 1)
+    out = np.empty((n, x.shape[1]), dtype=np.float32)
+    for ch in range(x.shape[1]):
+        out[:, ch] = np.interp(idx, np.arange(len(x)), x[:, ch])
+    return out
+
+
+def _to_mono_16k(data, in_rate):
+    """把采集数据降到识别所需的 16kHz 单声道。"""
+    x = _resample_16k(data, in_rate)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    return x
+
+
+class _StereoHistory:
+    """保留最近一段立体声音频，供 VAD 切出的时间段回取左右声道。"""
+
+    def __init__(self, seconds=40):
+        self.limit = int(seconds * SR)
+        self.parts = []
+        self.start = 0
+        self.end = 0
+
+    def append(self, block):
+        x = np.asarray(block, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[:, None]
+        if len(x) == 0:
+            return
+        self.parts.append(x.copy())
+        self.end += len(x)
+        while self.start < self.end - self.limit:
+            head = self.parts[0]
+            excess = self.end - self.limit - self.start
+            if excess >= len(head):
+                self.parts.pop(0)
+                self.start += len(head)
+            else:
+                self.parts[0] = head[excess:].copy()
+                self.start += excess
+
+    def get(self, start, count):
+        end = start + count
+        if start < self.start or end > self.end:
+            return None
+        out = []
+        pos = self.start
+        for part in self.parts:
+            part_end = pos + len(part)
+            if start < part_end and end > pos:
+                a = max(0, start - pos)
+                b = min(len(part), end - pos)
+                out.append(part[a:b])
+            if part_end >= end:
+                break
+            pos = part_end
+        if not out:
+            return None
+        x = np.concatenate(out, axis=0)
+        return x if len(x) == count else None
 
 
 def capture_loopback(device_kw=None, chunk=1024, follow=True):
-    """从系统声音回环录音，产出 16kHz float32 单声道。
+    """从系统声音回环录音，产出 16kHz float32。
 
     抓的是「送到该输出设备的音频流」，不是麦克风听到的声音——
     所以不外放、只插耳机、甚至把音量拉到 0，都一样能抓到。
-    采集保持设备的立体声格式，再在软件里降混，避免蓝牙耳机切到通话模式。
+    多声道设备返回 (frames, channels)；Pipeline 会自行取单声道做 VAD，
+    并在需要时分别识别左右声道。采集始终保留设备的原生声道布局。
     follow=True 时每约 2 秒看一眼默认输出设备有没有变，变了就重连。
     """
     import soundcard as sc
@@ -173,6 +235,7 @@ def capture_loopback(device_kw=None, chunk=1024, follow=True):
             cur = mic.name
 
         sw = 0
+        pending = None
         frames = chunk * max(1, native_sr // SR)
         try:
             while True:
@@ -181,10 +244,16 @@ def capture_loopback(device_kw=None, chunk=1024, follow=True):
                 except Exception as e:
                     print(f"[!] 录音中断：{e}，重连", flush=True)
                     break
-                x = _to_mono_16k(data, native_sr)
+                x = _resample_16k(data, native_sr)
                 if len(x) == 0:
                     continue
-                yield x
+                if pending is not None:
+                    x = np.concatenate([pending, x], axis=0)
+                offset = 0
+                while len(x) - offset >= chunk:
+                    yield x[offset:offset + chunk].copy()
+                    offset += chunk
+                pending = x[offset:].copy() if offset < len(x) else None
                 # 每约 2 秒检查一次默认设备（一个 chunk ≈ 64ms）
                 sw += 1
                 if follow and not device_kw and sw % 32 == 0:
@@ -389,7 +458,8 @@ class Pipeline:
         self._pend_at = 0  # 攒起来那一刻的累计采样数，用于超时兜底
         self._fed = 0      # 累计喂进来的采样数
         self._vad_total = 0
-        self._vad_base = 0.0
+        self._vad_base_samples = 0
+        self._stereo = _StereoHistory()
         # ASR+翻译放到独立线程：翻译一句要 0.3–4 秒，同步跑会把采集线程卡住，
         # soundcard 缓冲区一满就丢样本（日志里的 data discontinuity），
         # 表现为字幕既慢又缺字。这里只把切好的整段丢进队列，采集立刻返回。
@@ -409,9 +479,19 @@ class Pipeline:
             f.write(f"{self.idx}\n{fmt(t0)} --> {fmt(t1)}\n{zh}\n{ja}\n\n")
 
     def feed(self, chunk):
-        """喂一块 16k 音频，返回这段时间内产出的字幕列表。"""
+        """喂一块 16k 音频；单声道或 (frames, channels) 立体声均可。"""
         out = []
-        buf = chunk
+        chunk = np.asarray(chunk, dtype=np.float32)
+        if chunk.ndim == 2:
+            stereo = chunk
+            buf = chunk.mean(axis=1)
+        else:
+            stereo = None
+            buf = chunk
+        if len(buf) == 0:
+            return out
+        if stereo is not None:
+            self._stereo.append(stereo)
         self._fed += len(buf)
         W = 512
         dbg = os.environ.get("DBG_FEED")
@@ -425,11 +505,12 @@ class Pipeline:
                 seg = self.vad.front
                 # 必须先取出样本与起点，pop() 会让 seg 立即失效
                 samples = np.asarray(seg.samples, dtype=np.float32).copy()
-                seg_start = self._vad_base + seg.start / SR
+                start_samples = self._vad_base_samples + int(seg.start)
                 self.vad.pop()
                 if len(samples) < SR * 0.2:
                     continue
-                job = self._submit(samples, seg_start)
+                stereo_seg = self._stereo.get(start_samples, len(samples)) if stereo is not None else None
+                job = self._submit(samples, start_samples / SR, stereo_seg)
                 if job:
                     self._enqueue(*job)
 
@@ -439,10 +520,11 @@ class Pipeline:
                 cur = self.vad.current_segment
                 if len(cur.samples) >= SR * self.early_cut:
                     samples = np.asarray(cur.samples, dtype=np.float32).copy()
-                    seg_start = self._vad_base + cur.start / SR
+                    start_samples = self._vad_base_samples + int(cur.start)
+                    stereo_seg = self._stereo.get(start_samples, len(samples)) if stereo is not None else None
                     self.vad.reset()
-                    self._vad_base = self._vad_total / SR
-                    job = self._submit(samples, seg_start)
+                    self._vad_base_samples = self._vad_total
+                    job = self._submit(samples, start_samples / SR, stereo_seg)
                     if job:
                         self._enqueue(*job)
                     if self.verbose:
@@ -451,32 +533,36 @@ class Pipeline:
         # 阈值要大于「两句话之间的自然停顿 + VAD 末端延迟」，否则还没等到下一句
         # 就先被兜底放掉，半句照样被切碎（实测 2.0s 会把「気象庁」单独放出来）。
         if self._pend is not None and (self._fed - self._pend_at) > SR * 4.0:
-            s, st = self._pend
+            s, st, pstereo = self._pend
             self._pend = None
             if len(s) >= SR * 0.4:
-                self._enqueue(s, st)
+                self._enqueue(s, st, pstereo)
         if dbg:
             print(f"[dbg] bytes={len(buf)} acc={n_acc} fire={n_fire} out={len(out)} "
                   f"vad={type(self.vad).__name__}", file=sys.stderr)
         return out
 
-    def _submit(self, samples, start):
+    def _submit(self, samples, start, stereo=None):
         """太短的段落先攒着，和下一段拼起来再翻，避免"町長は"这种半句。"""
         if self._pend is not None:
-            ps, pst = self._pend
+            ps, pst, pstereo = self._pend
             samples = np.concatenate([ps, samples])
+            if pstereo is not None and stereo is not None:
+                stereo = np.concatenate([pstereo, stereo])
+            else:
+                stereo = None
             start = pst
             self._pend = None
         if len(samples) < SR * 2.2:
-            self._pend = (samples, start)
+            self._pend = (samples, start, stereo)
             self._pend_at = self._fed
             return None
-        return (samples, start)
+        return (samples, start, stereo)
 
-    def _enqueue(self, samples, start):
+    def _enqueue(self, samples, start, stereo=None):
         """翻译跟不上时宁可丢掉最旧的整段，也绝不阻塞采集。"""
         try:
-            self._work.put_nowait((samples, start))
+            self._work.put_nowait((samples, start, stereo))
         except queue.Full:
             try:
                 self._work.get_nowait()
@@ -485,7 +571,7 @@ class Pipeline:
             except queue.Empty:
                 pass
             try:
-                self._work.put_nowait((samples, start))
+                self._work.put_nowait((samples, start, stereo))
             except queue.Full:
                 pass
 
@@ -530,34 +616,99 @@ class Pipeline:
         parts.append(rest)
         return parts
 
-    def _process(self, samples, seg_start):
+    def _process(self, samples, seg_start, stereo=None):
         parts = self._split_long(samples)
         if len(parts) == 1:
-            return self._process_one(samples, seg_start)
+            channel_audio = stereo
+            if channel_audio is not None and len(channel_audio) != len(samples):
+                channel_audio = None
+            return self._process_one(samples, seg_start, channel_audio)
         res, off = None, 0.0
+        source_off = 0
         for p in parts:
-            r = self._process_one(p, seg_start + off)
+            channel_audio = None
+            if stereo is not None:
+                end = source_off + len(p)
+                if end <= len(stereo):
+                    channel_audio = stereo[source_off:end]
+            r = self._process_one(p, seg_start + off, channel_audio)
             off += len(p) / SR
+            source_off += len(p)
             if r:
                 res = r
         return res
 
-    def _process_one(self, samples, seg_start):
+    @staticmethod
+    def _channel_active(x):
+        return len(x) > 0 and float(np.max(np.abs(x))) >= 0.0015
+
+    @staticmethod
+    def _channels_equivalent(left, right):
+        nl = float(np.linalg.norm(left))
+        nr = float(np.linalg.norm(right))
+        if nl < 1e-6 or nr < 1e-6:
+            return False
+        corr = float(np.dot(left, right) / (nl * nr))
+        gain = min(nl, nr) / max(nl, nr)
+        return corr >= 0.90 and gain >= 0.60
+
+    @staticmethod
+    def _texts_similar(a, b):
+        def norm(s):
+            return re.sub(r"[\s、。,.!?！？「」『』…・：:]+", "", s or "")
+        a, b = norm(a), norm(b)
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    def _asr_text(self, samples):
+        padded = np.concatenate([np.zeros(SR // 2, dtype=np.float32), samples])
+        st = self.asr.create_stream()
+        st.accept_waveform(SR, padded)
+        self.asr.decode_stream(st)
+        return st.result.text.strip()
+
+    def _process_one(self, samples, seg_start, stereo=None):
         t0 = time.time()
         dur = len(samples) / SR
         # 关键：从句中切出来的片段必须先补一段静音，否则 transducer 的首个 chunk
         # 没有左上下文，开头几个词会被吞掉。实测 "はやくおじいさんに…" 会变成
         # "いかせたかったのです"；补 0.5s 前置静音后整句完全正确。
-        padded = np.concatenate([np.zeros(SR // 2, dtype=np.float32), samples])
-        st = self.asr.create_stream()
-        st.accept_waveform(SR, padded)
-        self.asr.decode_stream(st)
-        ja = st.result.text.strip()
+        ja = None
+        zh = None
+        dual = False
+        dual_left = dual_right = None
+        if stereo is not None and len(stereo) == len(samples) and stereo.shape[1] == 2:
+            left = stereo[:, 0]
+            right = stereo[:, 1]
+            active_l = self._channel_active(left)
+            active_r = self._channel_active(right)
+            if active_l != active_r:
+                ja = self._asr_text(left if active_l else right)
+            elif active_l and not self._channels_equivalent(left, right):
+                ja_l = self._asr_text(left)
+                ja_r = self._asr_text(right)
+                if ja_l and ja_r:
+                    if self._texts_similar(ja_l, ja_r) >= 0.88:
+                        ja = ja_l if len(ja_l) >= len(ja_r) else ja_r
+                    else:
+                        dual = True
+                        dual_left, dual_right = ja_l, ja_r
+                        ja = f"左：{ja_l}\n右：{ja_r}"
+                else:
+                    ja = ja_l or ja_r
+        if ja is None:
+            ja = self._asr_text(samples)
         t_asr = time.time() - t0
         if not ja:
             return None
         t1 = time.time()
-        zh = translate(normalize_numbers(ja))
+        if dual:
+            left_zh = translate(normalize_numbers(dual_left))
+            right_zh = translate(normalize_numbers(dual_right))
+            zh = f"左：{left_zh}\n右：{right_zh}"
+        else:
+            zh = translate(normalize_numbers(ja))
         t_mt = time.time() - t1
         if self.verbose:
             print(f"\n[JA] {ja}")
@@ -575,18 +726,19 @@ class Pipeline:
         while not self.vad.empty():
             seg = self.vad.front
             samples = np.asarray(seg.samples, dtype=np.float32).copy()
-            seg_start = self._vad_base + seg.start / SR
+            start_samples = self._vad_base_samples + int(seg.start)
+            stereo_seg = self._stereo.get(start_samples, len(samples))
             self.vad.pop()
             if len(samples) >= SR * 0.2:
-                job = self._submit(samples, seg_start)
+                job = self._submit(samples, start_samples / SR, stereo_seg)
                 if job:
                     self._enqueue(*job)
         self._drain()
         if self._pend is not None:
-            s, st = self._pend
+            s, st, pstereo = self._pend
             self._pend = None
             if len(s) >= SR * 0.4:
-                r = self._process(s, st)
+                r = self._process(s, st, pstereo)
                 if r:
                     res.append(r)
         return res
