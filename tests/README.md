@@ -15,6 +15,7 @@
 - `test_asr.py`：日语识别速度与准确率
 - `test_mt.py`、`bench_mt.py`：翻译模型质量与延迟
 - `test_loopback.py`、`test_capture_follow.py`：回环采集与设备跟随
+- `test_loopback_select.py`：确认默认设备是回环端点，而不是同名麦克风
 - `test_model_switch.py`、`test_ws_client.py`：插件后端协议
 - `test_overlay_check.py`、`test_overlay_opts.py`、`probe_overlay.py`、`gui_probe.py`：悬浮字幕样式与交互
 

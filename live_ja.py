@@ -19,6 +19,8 @@ import argparse
 import json
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -32,7 +34,9 @@ import numpy as np  # noqa: E402
 import sherpa_onnx  # noqa: E402  # noqa: E402
 
 SR = 16000
-OLLAMA = "http://127.0.0.1:11434/api/chat"
+CAPTURE_RATES = (48000, 44100)
+OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA = OLLAMA_HOST + "/api/chat"
 MT_MODEL = "qwen3.5:latest"
 MT_SYS = ("你是日语→简体中文的同声传译引擎。把用户给的日语句子翻成自然、简洁的中文。"
           "规则：①只输出译文，不加解释、不加引号、不附原文；"
@@ -81,26 +85,53 @@ def list_devices():
 
 
 def _resolve_loopback(device_kw):
-    """按关键字找回环设备；找不到就用当前默认输出设备的回环。"""
+    """只返回真正的回环设备，避免同名麦克风被误选。"""
     import soundcard as sc
+    loops = [m for m in sc.all_microphones(include_loopback=True) if m.isloopback]
     if device_kw:
-        cands = [m for m in sc.all_microphones(include_loopback=True)
-                 if device_kw.lower() in m.name.lower() and m.isloopback]
+        cands = [m for m in loops if device_kw.lower() in m.name.lower()]
         if not cands:
-            cands = [m for m in sc.all_microphones(include_loopback=True)
-                     if device_kw.lower() in m.name.lower()]
-        if not cands:
-            raise SystemExit(f"没找到匹配 '{device_kw}' 的设备，用 --list 看看")
+            raise SystemExit(f"没找到匹配 '{device_kw}' 的回环设备，用 --list 看看")
         return cands[0]
-    # 默认输出设备：耳机插上、蓝牙连上都会换成它，回环也就跟着走
-    return sc.get_microphone(sc.default_speaker().name, include_loopback=True)
+
+    # 蓝牙耳机的播放端和麦克风端经常同名。SoundCard 的 get_microphone()
+    # 在重名时会选中真实麦克风，导致蓝牙切到通话单声道，而且抓不到视频声。
+    name = sc.default_speaker().name
+    exact = [m for m in loops if m.name == name]
+    if exact:
+        return exact[0]
+    loose = [m for m in loops if m.name.casefold() == name.casefold()]
+    if loose:
+        return loose[0]
+    raise SystemExit(f"默认输出设备「{name}」没有对应的回环设备，用 --list 和 --device 指定")
+
+
+def _to_mono_16k(data, in_rate):
+    """把立体声采集降到识别所需的 16kHz 单声道。"""
+    x = np.asarray(data, dtype=np.float32)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    if in_rate == SR:
+        return x
+    if in_rate % SR == 0:
+        factor = in_rate // SR
+        n = len(x) // factor * factor
+        if n == 0:
+            return np.empty(0, dtype=np.float32)
+        return x[:n].reshape(-1, factor).mean(axis=1)
+    if len(x) < 2:
+        return np.empty(0, dtype=np.float32)
+    n = max(1, int(round(len(x) * SR / in_rate)))
+    idx = np.arange(n, dtype=np.float64) * in_rate / SR
+    return np.interp(idx, np.arange(len(x)), x).astype(np.float32)
 
 
 def capture_loopback(device_kw=None, chunk=1024, follow=True):
-    """从系统声音回环录音，产出 float32 单声道。
+    """从系统声音回环录音，产出 16kHz float32 单声道。
 
     抓的是「送到该输出设备的音频流」，不是麦克风听到的声音——
     所以不外放、只插耳机、甚至把音量拉到 0，都一样能抓到。
+    采集保持设备的立体声格式，再在软件里降混，避免蓝牙耳机切到通话模式。
     follow=True 时每约 2 秒看一眼默认输出设备有没有变，变了就重连。
     """
     import soundcard as sc
@@ -116,42 +147,42 @@ def capture_loopback(device_kw=None, chunk=1024, follow=True):
             print(f"[!] 取设备失败：{e}，1 秒后重试", flush=True)
             time.sleep(1)
             continue
+        if not mic.isloopback:
+            print(f"[!] {mic.name} 不是回环设备，跳过", flush=True)
+            time.sleep(1)
+            continue
+
+        channels = max(2, int(getattr(mic, "channels", 2) or 2))
+        rec = None
+        for native_sr in CAPTURE_RATES:
+            frames = chunk * max(1, native_sr // SR)
+            try:
+                rec = mic.recorder(samplerate=native_sr, channels=channels, blocksize=frames)
+                rec.__enter__()
+                break
+            except Exception as e:
+                rec = None
+                print(f"[!] {native_sr}Hz/{channels}ch 打不开：{e}", flush=True)
+        if rec is None:
+            print(f"[!] 打不开 {mic.name} 的回环，1 秒后重试", flush=True)
+            time.sleep(1)
+            continue
         if mic.name != cur:
-            print(f"录音设备：{mic.name}", flush=True)
+            print(f"录音设备：{mic.name}（回环 {channels}ch / {native_sr}Hz）", flush=True)
             cur = mic.name
 
-        native_sr = SR
-        try:
-            rec = mic.recorder(samplerate=SR, channels=1, blocksize=chunk)
-            rec.__enter__()
-        except Exception:
-            native_sr = 48000
-            try:
-                rec = mic.recorder(samplerate=native_sr, channels=1, blocksize=chunk * 3)
-                rec.__enter__()
-            except Exception as e:
-                print(f"[!] 打不开 {mic.name}：{e}，1 秒后重试", flush=True)
-                time.sleep(1)
-                continue
-        if native_sr != SR:
-            print(f"采样率：{native_sr}Hz（降到 {SR}Hz）", flush=True)
-
         sw = 0
+        frames = chunk * max(1, native_sr // SR)
         try:
             while True:
                 try:
-                    data = rec.record(numframes=chunk if native_sr == SR else chunk * 3)
+                    data = rec.record(numframes=frames)
                 except Exception as e:
                     print(f"[!] 录音中断：{e}，重连", flush=True)
                     break
-                x = np.asarray(data, dtype=np.float32)
-                if x.ndim > 1:
-                    x = x.mean(axis=1)
-                if native_sr != SR:
-                    n = len(x) // 3 * 3
-                    if n == 0:
-                        continue
-                    x = x[:n].reshape(-1, 3).mean(axis=1)
+                x = _to_mono_16k(data, native_sr)
+                if len(x) == 0:
+                    continue
                 yield x
                 # 每约 2 秒检查一次默认设备（一个 chunk ≈ 64ms）
                 sw += 1
@@ -287,8 +318,56 @@ def list_models():
     print(f"\n当前使用：{MT_MODEL}　要换模型加 --model 模型名")
 
 
+def _ollama_ready(timeout=0.8):
+    try:
+        with urllib.request.urlopen(OLLAMA_HOST + "/api/tags", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def ensure_ollama(timeout=25):
+    """确保本机 Ollama 服务在线；未运行时尝试自动拉起。"""
+    if _ollama_ready():
+        return True
+
+    candidates = [
+        shutil.which("ollama"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe"),
+        os.path.expandvars(r"%PROGRAMFILES%\Ollama\ollama.exe"),
+    ]
+    exe = next((p for p in candidates if p and os.path.isfile(p)), None)
+    if not exe:
+        print("[!] Ollama 未运行，且找不到 ollama.exe", flush=True)
+        return False
+
+    print(f"[*] Ollama 未运行，正在启动：{exe}", flush=True)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        subprocess.Popen(
+            [exe, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+    except Exception as e:
+        print(f"[!] 启动 Ollama 失败：{e}", flush=True)
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _ollama_ready(0.5):
+            print("[*] Ollama 服务已就绪", flush=True)
+            return True
+        time.sleep(0.5)
+    print(f"[!] Ollama 在 {timeout} 秒内没有就绪", flush=True)
+    return False
+
+
 def warmup():
     """先把 ollama 的模型拉进显存，否则首句翻译会等到超时。"""
+    ensure_ollama()
     t = time.time()
     r = translate("こんにちは", timeout=300)
     print(f"翻译模型预热完成（{time.time()-t:.1f}s）：{r}")
