@@ -35,6 +35,7 @@ import sherpa_onnx  # noqa: E402  # noqa: E402
 
 SR = 16000
 CAPTURE_RATES = (48000, 44100)
+EARLY_CUT_SECONDS = 5.0
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA = OLLAMA_HOST + "/api/chat"
 MT_MODEL = "qwen3.5:latest"
@@ -375,17 +376,20 @@ def warmup():
 
 # ─────────────────────────────── 管道 ───────────────────────────────
 class Pipeline:
-    def __init__(self, srt_path=None, gui=None, verbose=True):
+    def __init__(self, srt_path=None, gui=None, verbose=True, early_cut=EARLY_CUT_SECONDS):
         self.asr = build_asr(find_asr_dir())
         self.vad = build_vad()
         self.gui = gui
         self.verbose = verbose
+        self.early_cut = early_cut
         self.srt_path = srt_path
         self.idx = 0
         self.t_start = None
         self._pend = None  # 攒着太短的段落，等下一段一起翻
         self._pend_at = 0  # 攒起来那一刻的累计采样数，用于超时兜底
         self._fed = 0      # 累计喂进来的采样数
+        self._vad_total = 0
+        self._vad_base = 0.0
         # ASR+翻译放到独立线程：翻译一句要 0.3–4 秒，同步跑会把采集线程卡住，
         # soundcard 缓冲区一满就丢样本（日志里的 data discontinuity），
         # 表现为字幕既慢又缺字。这里只把切好的整段丢进队列，采集立刻返回。
@@ -414,19 +418,35 @@ class Pipeline:
         n_acc = n_fire = 0
         for i in range(0, len(buf) - W + 1, W):
             self.vad.accept_waveform(buf[i:i + W])
+            self._vad_total += W
             n_acc += 1
             while not self.vad.empty():
                 n_fire += 1
                 seg = self.vad.front
                 # 必须先取出样本与起点，pop() 会让 seg 立即失效
                 samples = np.asarray(seg.samples, dtype=np.float32).copy()
-                seg_start = seg.start
+                seg_start = self._vad_base + seg.start / SR
                 self.vad.pop()
                 if len(samples) < SR * 0.2:
                     continue
-                job = self._submit(samples, seg_start / SR)
+                job = self._submit(samples, seg_start)
                 if job:
                     self._enqueue(*job)
+
+            # 连续说话没有自然停顿时，VAD 不会交付整句。到达 early_cut 后
+            # 主动拿走当前段并重置 VAD，后面的真实音频仍从当前采样点继续。
+            if self.vad.is_speech_detected():
+                cur = self.vad.current_segment
+                if len(cur.samples) >= SR * self.early_cut:
+                    samples = np.asarray(cur.samples, dtype=np.float32).copy()
+                    seg_start = self._vad_base + cur.start / SR
+                    self.vad.reset()
+                    self._vad_base = self._vad_total / SR
+                    job = self._submit(samples, seg_start)
+                    if job:
+                        self._enqueue(*job)
+                    if self.verbose:
+                        print(f"\n[*] 连续语音 {len(samples)/SR:.1f}s，提前切段", file=sys.stderr)
         # 攒着的半句后面一直没声音时不能无限等，按音频时间兜底放出来。
         # 阈值要大于「两句话之间的自然停顿 + VAD 末端延迟」，否则还没等到下一句
         # 就先被兜底放掉，半句照样被切碎（实测 2.0s 会把「気象庁」单独放出来）。
@@ -555,10 +575,10 @@ class Pipeline:
         while not self.vad.empty():
             seg = self.vad.front
             samples = np.asarray(seg.samples, dtype=np.float32).copy()
-            seg_start = seg.start
+            seg_start = self._vad_base + seg.start / SR
             self.vad.pop()
             if len(samples) >= SR * 0.2:
-                job = self._submit(samples, seg_start / SR)
+                job = self._submit(samples, seg_start)
                 if job:
                     self._enqueue(*job)
         self._drain()
@@ -846,6 +866,8 @@ def main():
     ap.add_argument("--no-gui", action="store_true")
     ap.add_argument("--min-silence", type=float, default=0.35)
     ap.add_argument("--max-speech", type=float, default=15.0)
+    ap.add_argument("--long-cut", type=float, default=EARLY_CUT_SECONDS,
+                    help="连续语音提前切段的秒数，默认 5.0")
     ap.add_argument("--font", type=int, default=22, help="中文字号，默认 22")
     ap.add_argument("--width", type=float, default=0.70, help="字幕条占屏宽比例，默认 0.70")
     ap.add_argument("--alpha", type=float, default=0.82, help="背景不透明度，默认 0.82")
@@ -887,7 +909,7 @@ def main():
 
     if args.file:
         print("加载模型…")
-        pipe = Pipeline(args.srt, gui)
+        pipe = Pipeline(args.srt, gui, early_cut=max(2.0, args.long_cut))
         pipe.vad = build_vad(args.min_silence, args.max_speech)
         warmup()
         audio = read_wav(args.file)
@@ -901,7 +923,7 @@ def main():
         return
 
     print("加载模型…")
-    pipe = Pipeline(args.srt, gui)
+    pipe = Pipeline(args.srt, gui, early_cut=max(2.0, args.long_cut))
     pipe.vad = build_vad(args.min_silence, args.max_speech)
     warmup()
     print("就绪，开始监听系统声音")
